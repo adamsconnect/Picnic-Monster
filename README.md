@@ -1,4 +1,4 @@
-# My First Game 🌭
+# Picnic Monster 🌭
 
 A Flappy Bird–style browser game starring a fuzzy googly-eyed monster who has to dodge his way through a world of hot dogs, ketchup bottles, and mustard bottles. Built entirely in a single `index.html` file with plain HTML5 Canvas and vanilla JavaScript — no build step, no dependencies, no libraries.
 

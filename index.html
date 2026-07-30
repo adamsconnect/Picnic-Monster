@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>My First Game</title>
+</head>
+<body>
+
+<canvas id="game" width="400" height="600" style="background: skyblue; border: 2px solid black;"></canvas>
+
+<script>
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  const startY = 280;
+  const monsterX = 90; // fixed horizontal position during play, world scrolls instead
+  const squareSize = 22;
+
+  const groundHeight = 24;
+  const groundTopY = canvas.height - groundHeight;
+  const floorY = groundTopY - squareSize;
+  let groundScrollX = 0; // accumulates so the fry bed scrolls in step with the gates
+
+  let iconX = monsterX;
+  let squareY = startY;
+  let velocity = 0;
+  const gravity = 0.5;
+  const jumpStrength = -8;
+
+  // states: "playing", "bouncing" (flying off screen), "gameover"
+  let state = "playing";
+  let score = 0;
+
+  // buffers a jump pressed while the bounce-off animation is still playing
+  // so it fires the instant control returns, instead of being silently dropped
+  let jumpQueued = false;
+
+  let bounceVX = 0;
+  let bounceVY = 0;
+  let bounceRot = 0;
+  let bounceVRot = 0;
+
+  // trail of recent Y positions, used to draw the rainbow/fire trail behind the monster
+  let trailHistory = [];
+  const trailMaxLen = 26;
+
+  // --- top-3 high score tracking (persisted in localStorage) ---
+  const HIGH_SCORE_KEY = "monsterHotDogFlappy_highScores_v1";
+  let highScores = loadHighScores();
+  let isNewHigh = false;
+  let fireworkTimer = 0;
+
+  function loadHighScores() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(HIGH_SCORE_KEY));
+      return Array.isArray(raw) ? raw.slice(0, 3) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveHighScores() {
+    try {
+      localStorage.setItem(HIGH_SCORE_KEY, JSON.stringify(highScores));
+    } catch (e) {}
+  }
+
+  function recordScore(finalScore) {
+    const prevBest = highScores[0] || 0;
+    highScores.push(finalScore);
+    highScores.sort((a, b) => b - a);
+    highScores = highScores.slice(0, 3);
+    saveHighScores();
+    return finalScore > 0 && finalScore > prevBest;
+  }
+
+  // --- fireworks celebration for a new high score ---
+  let fireworks = [];
+
+  function spawnFirework(x, y) {
+    const hue = Math.floor(Math.random() * 360);
+    const count = 26;
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.2;
+      const speed = 1.5 + Math.random() * 2.5;
+      fireworks.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 0,
+        maxLife: 40 + Math.random() * 20,
+        hue: (hue + Math.random() * 40 - 20 + 360) % 360
+      });
+    }
+  }
+
+  function updateAndDrawFireworks(dt) {
+    fireworks.forEach(p => {
+      p.vy += 0.05 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life += dt;
+    });
+    fireworks = fireworks.filter(p => p.life < p.maxLife);
+    fireworks.forEach(p => {
+      const alpha = Math.max(0, 1 - p.life / p.maxLife);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${p.hue},90%,60%,${alpha})`;
+      ctx.fill();
+    });
+  }
+
+  // --- hot dog gates (the flappy-bird "pipes") ---
+  const gateWidth = 34;
+  const baseGapHeight = 170, minGapHeight = 120;
+  const baseSpacing = 230, minSpacing = 170;
+  const baseSpeed = 2.2, maxSpeed = 4.4;
+  let gates = [];
+
+  function gapHeightFor(s) { return Math.max(minGapHeight, baseGapHeight - s * 3); }
+  function spacingFor(s) { return Math.max(minSpacing, baseSpacing - s * 2); }
+  function speedFor(s) { return Math.min(maxSpeed, baseSpeed + s * 0.05); }
+
+  // "gap": one obstacle above + one below, fly through the gap between them
+  // "over": one obstacle rising from the ground, fly over it
+  // "under": one obstacle hanging from the ceiling, fly under it
+  const gateTypes = ["gap", "over", "under"];
+  const gateStyles = ["hotdog", "ketchup", "mustard"];
+
+  function spawnGate(xStart) {
+    const gapH = gapHeightFor(score);
+    const minCenter = gapH / 2 + 50;
+    const maxCenter = groundTopY - gapH / 2 - 40;
+    const gapY = minCenter + Math.random() * Math.max(10, maxCenter - minCenter);
+    const type = gateTypes[Math.floor(Math.random() * gateTypes.length)];
+    const style = gateStyles[Math.floor(Math.random() * gateStyles.length)];
+    gates.push({ x: xStart, gapY, gapHeight: gapH, passed: false, type, style });
+  }
+
+  function maybeSpawnGate() {
+    const spacing = spacingFor(score);
+    const last = gates[gates.length - 1];
+    if (!last || last.x <= canvas.width - spacing) {
+      spawnGate(canvas.width + gateWidth);
+    }
+  }
+
+  function jump() {
+    if (state === "playing") {
+      velocity = jumpStrength;
+    } else if (state === "gameover") {
+      restart();
+    } else if (state === "bouncing") {
+      jumpQueued = true;
+    }
+  }
+
+  function restart() {
+    iconX = monsterX;
+    squareY = startY;
+    velocity = 0;
+    score = 0;
+    gates = [];
+    trailHistory = [];
+    fireworks = [];
+    isNewHigh = false;
+    groundScrollX = 0;
+    maybeSpawnGate();
+    state = "playing";
+  }
+
+  function hitObstacle() {
+    // pop up and drift off to a random side, indicating game over
+    const dir = Math.random() < 0.5 ? -1 : 1;
+    bounceVX = dir * (3 + Math.random() * 2);
+    bounceVY = -10 - Math.random() * 3;
+    bounceRot = 0;
+    bounceVRot = dir * 0.15;
+    iconX = monsterX;
+    state = "bouncing";
+  }
+
+  // --- icon: an original fuzzy googly-eyed monster, pre-rendered once at
+  // high resolution so it can be drawn crisp at any scale ---
+  const iconRes = 80;
+  const iconCanvas = document.createElement("canvas");
+  iconCanvas.width = iconRes;
+  iconCanvas.height = iconRes;
+  const iconCtx = iconCanvas.getContext("2d");
+
+  (function drawIcon() {
+    const r = iconRes / 2;
+    const cx = r, cy = r;
+
+    function googlyEye(x, y, size) {
+      iconCtx.beginPath();
+      iconCtx.arc(x, y, size, 0, Math.PI * 2);
+      iconCtx.fillStyle = "white";
+      iconCtx.fill();
+      iconCtx.lineWidth = 1.5;
+      iconCtx.strokeStyle = "#333";
+      iconCtx.stroke();
+
+      const ox = (Math.random() - 0.5) * size * 0.5;
+      const oy = (Math.random() - 0.5) * size * 0.5;
+      iconCtx.beginPath();
+      iconCtx.arc(x + ox, y + oy, size * 0.42, 0, Math.PI * 2);
+      iconCtx.fillStyle = "black";
+      iconCtx.fill();
+    }
+
+    // fuzzy, spiky body silhouette
+    const spikes = 14;
+    iconCtx.beginPath();
+    for (let i = 0; i < spikes * 2; i++) {
+      const angle = (Math.PI * 2 * i) / (spikes * 2);
+      const radius = (i % 2 === 0) ? r - 2 : r - 9;
+      const px = cx + Math.cos(angle) * radius;
+      const py = cy + Math.sin(angle) * radius;
+      if (i === 0) iconCtx.moveTo(px, py);
+      else iconCtx.lineTo(px, py);
+    }
+    iconCtx.closePath();
+
+    const grad = iconCtx.createRadialGradient(cx - 12, cy - 12, 4, cx, cy, r);
+    grad.addColorStop(0, "#b388ff");
+    grad.addColorStop(1, "#6a1fc7");
+    iconCtx.fillStyle = grad;
+    iconCtx.fill();
+    iconCtx.lineWidth = 2;
+    iconCtx.strokeStyle = "#4a1191";
+    iconCtx.stroke();
+
+    // little horns
+    iconCtx.fillStyle = "#4a1191";
+    iconCtx.beginPath();
+    iconCtx.moveTo(cx - 18, cy - r + 20);
+    iconCtx.lineTo(cx - 26, cy - r);
+    iconCtx.lineTo(cx - 8, cy - r + 14);
+    iconCtx.closePath();
+    iconCtx.fill();
+    iconCtx.beginPath();
+    iconCtx.moveTo(cx + 18, cy - r + 20);
+    iconCtx.lineTo(cx + 26, cy - r);
+    iconCtx.lineTo(cx + 8, cy - r + 14);
+    iconCtx.closePath();
+    iconCtx.fill();
+
+    // mismatched googly eyes
+    googlyEye(cx - 16, cy - 4, 14);
+    googlyEye(cx + 14, cy - 9, 10);
+
+    // grinning mouth with teeth
+    iconCtx.beginPath();
+    iconCtx.ellipse(cx, cy + 18, 16, 9, 0, 0, Math.PI * 2);
+    iconCtx.fillStyle = "#2b0033";
+    iconCtx.fill();
+
+    iconCtx.fillStyle = "white";
+    iconCtx.beginPath();
+    iconCtx.moveTo(cx - 9, cy + 11);
+    iconCtx.lineTo(cx - 4, cy + 11);
+    iconCtx.lineTo(cx - 6.5, cy + 18);
+    iconCtx.closePath();
+    iconCtx.fill();
+    iconCtx.beginPath();
+    iconCtx.moveTo(cx + 4, cy + 11);
+    iconCtx.lineTo(cx + 9, cy + 11);
+    iconCtx.lineTo(cx + 6.5, cy + 18);
+    iconCtx.closePath();
+    iconCtx.fill();
+  })();
+
+  function drawIconAt(x, y, rotation) {
+    ctx.save();
+    ctx.translate(x + squareSize / 2, y + squareSize / 2);
+    ctx.rotate(rotation);
+    ctx.drawImage(iconCanvas, -squareSize / 2, -squareSize / 2, squareSize, squareSize);
+    ctx.restore();
+  }
+
+  // rainbow trail from score 10, upgrading to a fire trail from score 20
+  function drawTrail() {
+    const mode = score >= 20 ? "fire" : (score >= 10 ? "rainbow" : null);
+    if (!mode || trailHistory.length < 2) return;
+
+    for (let i = 0; i < trailHistory.length; i++) {
+      const age = trailHistory.length - i;
+      const px = monsterX - age * 3.2;
+      if (px < -10) continue;
+      const py = trailHistory[i] + squareSize / 2;
+      const alpha = Math.max(0, 1 - age / trailHistory.length);
+      const size = Math.max(2, (squareSize / 2) * (1 - age / (trailHistory.length * 1.3)));
+
+      if (mode === "rainbow") {
+        const hue = (i * 24) % 360;
+        ctx.fillStyle = `hsla(${hue},90%,55%,${alpha})`;
+        ctx.beginPath();
+        ctx.arc(px, py, size, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        const flicker = Math.sin(i + performance.now() * 0.02) * 2;
+        const hue = Math.max(0, 42 - age * 1.2);
+        ctx.fillStyle = `hsla(${hue},100%,55%,${alpha})`;
+        ctx.beginPath();
+        ctx.ellipse(px, py + flicker, size * 0.8, size * 1.1, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  // flickering flame aura drawn on the monster itself once score reaches 20
+  function drawFireAura(cx, cy) {
+    const t = performance.now() * 0.006;
+    for (let i = 0; i < 5; i++) {
+      const ang = (i / 5) * Math.PI * 2 + t;
+      const r = squareSize * 0.55 + Math.sin(t * 2 + i) * 2;
+      const fx = cx + Math.cos(ang) * r;
+      const fy = cy + Math.sin(ang) * r * 0.7 - 2;
+      const flick = 3 + Math.sin(t * 5 + i) * 2;
+      ctx.beginPath();
+      ctx.ellipse(fx, fy, flick, flick * 1.6, 0, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${20 + (i % 3) * 15},100%,55%,0.75)`;
+      ctx.fill();
+    }
+  }
+
+  // --- hot dog obstacle rendering: one single vertical hot dog per side,
+  // planted flush into the ceiling/ground with a rounded free tip facing the gap ---
+  function roundedCapRectPath(x, y, w, h, r, tipAt) {
+    ctx.beginPath();
+    if (tipAt === "top") {
+      ctx.moveTo(x, y + r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.arcTo(x + w, y, x + w, y + r, r);
+      ctx.lineTo(x + w, y + h);
+      ctx.lineTo(x, y + h);
+      ctx.closePath();
+    } else {
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + w, y);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y + h - r, r);
+      ctx.closePath();
+    }
+  }
+
+  function drawVerticalHotDog(x, topY, bottomY, tipAt) {
+    const w = gateWidth;
+    const h = bottomY - topY;
+    if (h <= 0) return;
+    const r = w / 2;
+
+    // bun
+    roundedCapRectPath(x, topY, w, h, r, tipAt);
+    const bunGrad = ctx.createLinearGradient(x, 0, x + w, 0);
+    bunGrad.addColorStop(0, "#f6dca8");
+    bunGrad.addColorStop(0.5, "#e8b975");
+    bunGrad.addColorStop(1, "#d9a45f");
+    ctx.fillStyle = bunGrad;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#a9743d";
+    ctx.stroke();
+
+    // sausage, poking slightly past the bun's rounded tip
+    const sw = w * 0.55;
+    const sx = x + (w - sw) / 2;
+    const overhang = 9;
+    const sr = sw / 2;
+    const sTop = tipAt === "top" ? topY - overhang : topY;
+    const sBottom = tipAt === "top" ? bottomY : bottomY + overhang;
+
+    roundedCapRectPath(sx, sTop, sw, sBottom - sTop, sr, tipAt);
+    const sGrad = ctx.createLinearGradient(sx, 0, sx + sw, 0);
+    sGrad.addColorStop(0, "#c2694a");
+    sGrad.addColorStop(0.5, "#8b3a2b");
+    sGrad.addColorStop(1, "#722f22");
+    ctx.fillStyle = sGrad;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#5c2419";
+    ctx.stroke();
+
+    // glossy highlight, kept well clear of the rounded tip so it doesn't spill past the edge
+    const hlY = tipAt === "top" ? sTop + 32 : sBottom - 32;
+    ctx.beginPath();
+    ctx.ellipse(sx + sw * 0.32, hlY, sw * 0.13, Math.min(22, h * 0.12), 0, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.fill();
+
+    // mustard zigzag drizzle along the length
+    ctx.beginPath();
+    let dir = 1;
+    const zigStart = sTop + 12;
+    const zigEnd = sBottom - 12;
+    ctx.moveTo(sx + sw / 2, zigStart);
+    for (let yy = zigStart + 14; yy < zigEnd; yy += 14) {
+      const zx = sx + sw / 2 + dir * (sw / 2 - 3);
+      ctx.lineTo(zx, yy);
+      dir *= -1;
+    }
+    ctx.strokeStyle = "#f2c200";
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+    ctx.stroke();
+  }
+
+  // --- condiment bottle obstacle rendering (ketchup / mustard) ---
+  const bottlePalettes = {
+    ketchup: { body1: "#ff6a52", body2: "#e0402c", body3: "#a82418", cap: "#7a1a10", label: "#ffe9e0" },
+    mustard: { body1: "#ffe066", body2: "#f4c430", body3: "#c99a10", cap: "#7a5c00", label: "#fff6d8" }
+  };
+
+  function drawVerticalBottle(x, topY, bottomY, tipAt, kind) {
+    const w = gateWidth;
+    const h = bottomY - topY;
+    if (h <= 0) return;
+    const palette = bottlePalettes[kind];
+
+    const capLen = 12;
+    const neckLen = 22;
+    const capW = w * 0.42;
+
+    let bodyTop, bodyBottom, neckTop, neckBottom, capTop, capBottom;
+    if (tipAt === "bottom") {
+      capBottom = bottomY; capTop = bottomY - capLen;
+      neckBottom = capTop; neckTop = neckBottom - neckLen;
+      bodyBottom = neckTop; bodyTop = topY;
+    } else {
+      capTop = topY; capBottom = topY + capLen;
+      neckTop = capBottom; neckBottom = neckTop + neckLen;
+      bodyTop = neckBottom; bodyBottom = bottomY;
+    }
+
+    // body
+    ctx.beginPath();
+    ctx.rect(x, bodyTop, w, Math.max(0, bodyBottom - bodyTop));
+    const bodyGrad = ctx.createLinearGradient(x, 0, x + w, 0);
+    bodyGrad.addColorStop(0, palette.body1);
+    bodyGrad.addColorStop(0.5, palette.body2);
+    bodyGrad.addColorStop(1, palette.body3);
+    ctx.fillStyle = bodyGrad;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = palette.body3;
+    ctx.stroke();
+
+    // label band with a simple drip icon (no brand marks)
+    const labelH = Math.min(40, Math.max(0, bodyBottom - bodyTop) * 0.4);
+    const labelY = bodyTop + (bodyBottom - bodyTop - labelH) / 2;
+    if (labelH > 6) {
+      ctx.beginPath();
+      ctx.rect(x + 3, labelY, w - 6, labelH);
+      ctx.fillStyle = palette.label;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = palette.body3;
+      ctx.stroke();
+
+      ctx.beginPath();
+      const dcx = x + w / 2, dcy = labelY + labelH / 2;
+      ctx.moveTo(dcx, dcy - 7);
+      ctx.quadraticCurveTo(dcx + 6, dcy + 2, dcx, dcy + 8);
+      ctx.quadraticCurveTo(dcx - 6, dcy + 2, dcx, dcy - 7);
+      ctx.closePath();
+      ctx.fillStyle = palette.body2;
+      ctx.fill();
+    }
+
+    // tapered neck
+    ctx.beginPath();
+    if (tipAt === "bottom") {
+      ctx.moveTo(x, neckTop);
+      ctx.lineTo(x + w, neckTop);
+      ctx.lineTo(x + w / 2 + capW / 2, neckBottom);
+      ctx.lineTo(x + w / 2 - capW / 2, neckBottom);
+      ctx.closePath();
+    } else {
+      ctx.moveTo(x + w / 2 - capW / 2, neckTop);
+      ctx.lineTo(x + w / 2 + capW / 2, neckTop);
+      ctx.lineTo(x + w, neckBottom);
+      ctx.lineTo(x, neckBottom);
+      ctx.closePath();
+    }
+    ctx.fillStyle = palette.body2;
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = palette.body3;
+    ctx.stroke();
+
+    // cap, rounded at the free tip end
+    const capX = x + (w - capW) / 2;
+    roundedCapRectPath(capX, capTop, capW, capBottom - capTop, capW / 2, tipAt);
+    ctx.fillStyle = palette.cap;
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#2a1206";
+    ctx.stroke();
+  }
+
+  function drawGates() {
+    gates.forEach(g => {
+      const gapTop = g.gapY - g.gapHeight / 2;
+      const gapBottom = g.gapY + g.gapHeight / 2;
+      const drawObstacle = g.style === "ketchup"
+        ? (x, t, b, tip) => drawVerticalBottle(x, t, b, tip, "ketchup")
+        : g.style === "mustard"
+          ? (x, t, b, tip) => drawVerticalBottle(x, t, b, tip, "mustard")
+          : drawVerticalHotDog;
+      if (g.type !== "over") {
+        drawObstacle(g.x, 0, gapTop, "bottom"); // hangs from the ceiling
+      }
+      if (g.type !== "under") {
+        drawObstacle(g.x, gapBottom, groundTopY, "top"); // rises from the ground
+      }
+    });
+  }
+
+  // --- scrolling bed of fries along the floor ---
+  const fryTileWidth = 34;
+  const fryPattern = (() => {
+    const pattern = [];
+    const count = 4;
+    for (let i = 0; i < count; i++) {
+      const seedA = Math.sin(i * 12.9898) * 43758.5453;
+      const seedB = Math.sin(i * 78.233) * 12345.678;
+      const randA = seedA - Math.floor(seedA);
+      const randB = seedB - Math.floor(seedB);
+      pattern.push({
+        dx: (i + 0.5) * (fryTileWidth / count) + (randA * 6 - 3),
+        h: 14 + randB * 8,
+        rot: randA * 16 - 8
+      });
+    }
+    return pattern;
+  })();
+
+  function drawFry(x, baseY, h, rotDeg) {
+    const w = 6;
+    ctx.save();
+    ctx.translate(x, baseY);
+    ctx.rotate((rotDeg * Math.PI) / 180);
+
+    roundedCapRectPath(-w / 2, -h, w, h, w * 0.3, "top");
+    const grad = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
+    grad.addColorStop(0, "#ffe17a");
+    grad.addColorStop(0.5, "#f8c942");
+    grad.addColorStop(1, "#e0a828");
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#b8811a";
+    ctx.stroke();
+
+    // browned tip
+    ctx.beginPath();
+    ctx.ellipse(0, -h + 3, w * 0.4, 3, 0, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(150,90,20,0.5)";
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawGround() {
+    // red liner strip at the very bottom, like a fry box
+    ctx.fillStyle = "#c0392b";
+    ctx.fillRect(0, groundTopY + groundHeight - 6, canvas.width, 6);
+
+    // fry bed surface
+    ctx.fillStyle = "#e8a93a";
+    ctx.fillRect(0, groundTopY, canvas.width, groundHeight - 6);
+
+    const offset = groundScrollX % fryTileWidth;
+    const baseY = groundTopY + groundHeight - 6;
+    for (let tileX = -offset; tileX < canvas.width + fryTileWidth; tileX += fryTileWidth) {
+      fryPattern.forEach(f => drawFry(tileX + f.dx, baseY, f.h, f.rot));
+    }
+  }
+
+  function drawScore() {
+    ctx.font = "bold 32px sans-serif";
+    ctx.textAlign = "center";
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "white";
+    ctx.strokeText(score, canvas.width / 2, 55);
+    ctx.fillStyle = "#333";
+    ctx.fillText(score, canvas.width / 2, 55);
+  }
+
+  maybeSpawnGate();
+
+  // frame-rate independent timing: dt is normalized so dt === 1 at a steady
+  // 60fps, regardless of the display's actual refresh rate
+  let lastTime = null;
+
+  function update(timestamp) {
+    if (lastTime === null) lastTime = timestamp;
+    let dt = (timestamp - lastTime) / (1000 / 60);
+    dt = Math.min(dt, 3); // clamp so tab-switches/hitches don't cause a big jump
+    lastTime = timestamp;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (state === "playing") {
+      velocity += gravity * dt;
+      squareY += velocity * dt;
+
+      // ceiling: blocks flying off the top of the screen
+      if (squareY < 0) {
+        squareY = 0;
+        if (velocity < 0) velocity = 0;
+      }
+
+      const speed = speedFor(score);
+      gates.forEach(g => { g.x -= speed * dt; });
+      gates = gates.filter(g => g.x + gateWidth > -5);
+      maybeSpawnGate();
+      groundScrollX += speed * dt;
+
+      gates.forEach(g => {
+        if (!g.passed && g.x + gateWidth < monsterX) {
+          g.passed = true;
+          score++;
+        }
+      });
+
+      if (squareY >= floorY) {
+        squareY = floorY;
+        hitObstacle();
+      } else {
+        for (const g of gates) {
+          if (g.x < monsterX + squareSize && g.x + gateWidth > monsterX) {
+            const hitsTop = g.type !== "over" && squareY < g.gapY - g.gapHeight / 2;
+            const hitsBottom = g.type !== "under" && squareY + squareSize > g.gapY + g.gapHeight / 2;
+            if (hitsTop || hitsBottom) {
+              hitObstacle();
+              break;
+            }
+          }
+        }
+      }
+
+      if (score >= 10) {
+        trailHistory.push(squareY);
+        if (trailHistory.length > trailMaxLen) trailHistory.shift();
+      }
+
+      drawGates();
+      drawGround();
+      if (state === "playing") {
+        drawTrail();
+        drawIconAt(monsterX, squareY, 0);
+        if (score >= 20) drawFireAura(monsterX + squareSize / 2, squareY + squareSize / 2);
+        drawScore();
+      }
+
+    } else if (state === "bouncing") {
+      bounceVY += gravity * dt;
+      iconX += bounceVX * dt;
+      squareY += bounceVY * dt;
+      bounceRot += bounceVRot * dt;
+
+      if (squareY >= floorY) {
+        squareY = floorY;
+        bounceVY *= -0.7;
+      }
+
+      drawGates();
+      drawGround();
+      drawIconAt(iconX, squareY, bounceRot);
+      if (score >= 20) drawFireAura(iconX + squareSize / 2, squareY + squareSize / 2);
+      drawScore();
+
+      if (iconX + squareSize < 0 || iconX > canvas.width) {
+        const newHigh = recordScore(score);
+        if (jumpQueued) {
+          jumpQueued = false;
+          restart();
+        } else {
+          state = "gameover";
+          isNewHigh = newHigh;
+          fireworkTimer = 0;
+          if (isNewHigh) {
+            for (let k = 0; k < 4; k++) {
+              spawnFirework(60 + Math.random() * 280, 90 + Math.random() * 180);
+            }
+          }
+        }
+      }
+
+    } else if (state === "gameover") {
+      drawGates();
+      drawGround();
+
+      if (isNewHigh) {
+        fireworkTimer -= dt;
+        if (fireworkTimer <= 0) {
+          spawnFirework(60 + Math.random() * 280, 90 + Math.random() * 180);
+          fireworkTimer = 35 + Math.random() * 25;
+        }
+      }
+
+      ctx.textAlign = "center";
+      let ty = canvas.height / 2 - 80;
+
+      ctx.fillStyle = "black";
+      ctx.font = "24px sans-serif";
+      ctx.fillText("Game Over", canvas.width / 2, ty);
+      ty += 32;
+
+      ctx.font = "18px sans-serif";
+      ctx.fillText("Score: " + score, canvas.width / 2, ty);
+      ty += 28;
+
+      if (isNewHigh) {
+        ctx.fillStyle = "#d4a017";
+        ctx.font = "bold 18px sans-serif";
+        ctx.fillText("New High Score!", canvas.width / 2, ty);
+        ty += 26;
+        ctx.fillStyle = "black";
+      }
+
+      ctx.font = "15px sans-serif";
+      const bestText = highScores.length
+        ? "Best: " + highScores.map((s, i) => (i + 1) + ") " + s).join("   ")
+        : "Best: —";
+      ctx.fillText(bestText, canvas.width / 2, ty);
+      ty += 30;
+
+      ctx.font = "16px sans-serif";
+      ctx.fillText("Click or press Space to restart", canvas.width / 2, ty);
+
+      updateAndDrawFireworks(dt);
+    }
+
+    requestAnimationFrame(update);
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") jump();
+  });
+
+  canvas.addEventListener("click", jump);
+
+  requestAnimationFrame(update);
+</script>
+
+</body>
+</html>
